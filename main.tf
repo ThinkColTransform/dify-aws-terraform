@@ -1,5 +1,6 @@
 provider "aws" {
-  region = var.aws_region
+  region  = var.aws_region
+  profile = "rthk_dev"
 
   default_tags {
     tags = var.default_tags
@@ -17,7 +18,7 @@ resource "aws_s3_bucket" "storage" {
 # VPC
 
 data "aws_vpc" "this" {
-  id = var.vpc_id
+  id = local.vpc_id
 }
 
 # Redis
@@ -25,7 +26,7 @@ data "aws_vpc" "this" {
 resource "aws_security_group" "redis" {
   name        = "dify-redis"
   description = "Redis for Dify"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-redis" }
   # API/Worker からの ingress を下の方で定義している
 }
@@ -33,7 +34,7 @@ resource "aws_security_group" "redis" {
 resource "aws_elasticache_subnet_group" "redis" {
   name        = "dify-redis"
   description = "Redis for Dify"
-  subnet_ids  = var.private_subnet_ids
+  subnet_ids  = local.private_subnet_ids
 }
 
 # MOVED エラーが発生するのでクラスターモードは使わない
@@ -85,7 +86,7 @@ resource "aws_elasticache_replication_group" "redis" {
 resource "aws_security_group" "database" {
   name        = "dify-db"
   description = "PostgreSQL for Dify"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-db" }
   # API/Worker からの ingress を下の方で定義している
 }
@@ -105,18 +106,18 @@ resource "aws_security_group_rule" "database_to_internet" {
 resource "aws_db_subnet_group" "dify" {
   name        = "dify"
   description = "PostgreSQL for Dify"
-  subnet_ids  = var.private_subnet_ids
+  subnet_ids  = local.private_subnet_ids
 }
 
 resource "aws_rds_cluster" "dify" {
   cluster_identifier = "dify"
 
   engine         = "aurora-postgresql"
-  engine_version = "15.4"
+  engine_version = "17.4"
   port           = 5432
 
   db_subnet_group_name            = aws_db_subnet_group.dify.name
-  db_cluster_parameter_group_name = "default.aurora-postgresql15"
+  db_cluster_parameter_group_name = "default.aurora-postgresql17"
   vpc_security_group_ids          = [aws_security_group.database.id]
 
   master_username = "postgres"
@@ -163,7 +164,7 @@ resource "aws_rds_cluster_instance" "dify" {
   auto_minor_version_upgrade = true
   promotion_tier             = 1
 
-  db_parameter_group_name = "default.aurora-postgresql15"
+  db_parameter_group_name = "default.aurora-postgresql17"
   db_subnet_group_name    = aws_db_subnet_group.dify.name
 
   performance_insights_enabled          = true
@@ -301,6 +302,36 @@ resource "aws_ssm_parameter" "broker_url" {
   value      = "rediss://:${var.redis_password}@${aws_elasticache_replication_group.redis.primary_endpoint_address}:6379/0" # ElastiCache Redis では db0 以外使えない
   lifecycle {
     # ignore_changes = [value]
+  }
+}
+
+resource "random_password" "plugin_daemon_key" {
+  length           = 42
+  special          = true
+  override_special = "-_=+/"
+}
+
+resource "aws_ssm_parameter" "plugin_daemon_key" {
+  type  = "SecureString"
+  name  = "${local.ssm_parameter_prefix}/PLUGIN_DAEMON_KEY"
+  value = random_password.plugin_daemon_key.result
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "random_password" "plugin_inner_api_key" {
+  length           = 42
+  special          = true
+  override_special = "-_=+/"
+}
+
+resource "aws_ssm_parameter" "plugin_inner_api_key" {
+  type  = "SecureString"
+  name  = "${local.ssm_parameter_prefix}/PLUGIN_DIFY_INNER_API_KEY"
+  value = random_password.plugin_inner_api_key.result
+  lifecycle {
+    ignore_changes = [value]
   }
 }
 
@@ -453,6 +484,17 @@ resource "aws_ecs_task_definition" "dify_api" {
           CODE_MAX_NUMBER_ARRAY_LENGTH  = 1000
           # Indexing configuration
           INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH = 1000
+          # Plugin daemon
+          PLUGIN_DAEMON_URL          = "http://plugin-daemon.dify.local:5002"
+          PLUGIN_MAX_PACKAGE_SIZE    = 52428800
+          PLUGIN_DAEMON_TIMEOUT      = "600.0"
+          PLUGIN_REMOTE_INSTALL_HOST = "0.0.0.0"
+          PLUGIN_REMOTE_INSTALL_PORT = 5003
+          DB_PLUGIN_DATABASE         = "dify_plugin"
+          MARKETPLACE_ENABLED        = true
+          MARKETPLACE_API_URL        = "https://marketplace.dify.ai"
+          FORCE_VERIFYING_SIGNATURE  = true
+          DEPLOY_ENV                 = "PRODUCTION"
         } : { name = name, value = tostring(value) }
       ]
       secrets = [
@@ -468,8 +510,6 @@ resource "aws_ecs_task_definition" "dify_api" {
           name      = "REDIS_PASSWORD"
           valueFrom = aws_ssm_parameter.redis_password.name
         },
-        # The configurations of celery broker.
-        # Use redis as the broker, and redis db 1 for celery broker.
         {
           name      = "CELERY_BROKER_URL"
           valueFrom = aws_ssm_parameter.broker_url.name
@@ -481,6 +521,14 @@ resource "aws_ecs_task_definition" "dify_api" {
         {
           name      = "CODE_EXECUTION_API_KEY"
           valueFrom = aws_ssm_parameter.sandbox_key.name
+        },
+        {
+          name      = "INNER_API_KEY_FOR_PLUGIN"
+          valueFrom = aws_ssm_parameter.plugin_inner_api_key.name
+        },
+        {
+          name      = "PLUGIN_DAEMON_KEY"
+          valueFrom = aws_ssm_parameter.plugin_daemon_key.name
         }
       ]
       logConfiguration = {
@@ -575,7 +623,7 @@ resource "aws_ecs_task_definition" "dify_api" {
 resource "aws_security_group" "api" {
   name        = "dify-api"
   description = "Dify API"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-api" }
 }
 
@@ -681,6 +729,14 @@ resource "aws_ecs_task_definition" "dify_worker" {
           # SMTP_USE_TLS = 'true'
           # Indexing configuration
           INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH = "1000"
+          # Plugin daemon
+          PLUGIN_DAEMON_URL         = "http://plugin-daemon.dify.local:5002"
+          PLUGIN_MAX_PACKAGE_SIZE   = 52428800
+          DB_PLUGIN_DATABASE        = "dify_plugin"
+          MARKETPLACE_ENABLED       = true
+          MARKETPLACE_API_URL       = "https://marketplace.dify.ai"
+          FORCE_VERIFYING_SIGNATURE = true
+          DEPLOY_ENV                = "PRODUCTION"
         } : { name = name, value = tostring(value) }
       ]
       secrets = [
@@ -696,8 +752,6 @@ resource "aws_ecs_task_definition" "dify_worker" {
           name      = "REDIS_PASSWORD"
           valueFrom = aws_ssm_parameter.redis_password.name
         },
-        # The configurations of celery broker.
-        # Use redis as the broker, and redis db 1 for celery broker.
         {
           name      = "CELERY_BROKER_URL"
           valueFrom = aws_ssm_parameter.broker_url.name
@@ -705,6 +759,14 @@ resource "aws_ecs_task_definition" "dify_worker" {
         {
           name      = "PGVECTOR_PASSWORD"
           valueFrom = aws_ssm_parameter.db_password.name
+        },
+        {
+          name      = "INNER_API_KEY_FOR_PLUGIN"
+          valueFrom = aws_ssm_parameter.plugin_inner_api_key.name
+        },
+        {
+          name      = "PLUGIN_DAEMON_KEY"
+          valueFrom = aws_ssm_parameter.plugin_daemon_key.name
         }
       ]
       logConfiguration = {
@@ -734,7 +796,7 @@ resource "aws_ecs_task_definition" "dify_worker" {
 resource "aws_security_group" "worker" {
   name        = "dify-worker"
   description = "Dify Worker"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-worker" }
 }
 
@@ -766,6 +828,222 @@ resource "aws_security_group_rule" "worker_to_redis" {
   from_port                = 6379
   to_port                  = 6379
   source_security_group_id = aws_security_group.worker.id
+}
+
+# Dify Plugin Daemon
+
+resource "aws_security_group" "plugin_daemon" {
+  name        = "dify-plugin-daemon"
+  description = "Dify Plugin Daemon"
+  vpc_id      = local.vpc_id
+  tags        = { Name = "dify-plugin-daemon" }
+}
+
+resource "aws_security_group_rule" "plugin_daemon_to_internet" {
+  security_group_id = aws_security_group.plugin_daemon.id
+  type              = "egress"
+  description       = "Internet"
+  protocol          = "all"
+  from_port         = 0
+  to_port           = 0
+  cidr_blocks       = ["0.0.0.0/0"]
+}
+
+resource "aws_security_group_rule" "api_to_plugin_daemon" {
+  security_group_id        = aws_security_group.plugin_daemon.id
+  type                     = "ingress"
+  description              = "API to Plugin Daemon"
+  protocol                 = "tcp"
+  from_port                = 5002
+  to_port                  = 5002
+  source_security_group_id = aws_security_group.api.id
+}
+
+resource "aws_security_group_rule" "worker_to_plugin_daemon" {
+  security_group_id        = aws_security_group.plugin_daemon.id
+  type                     = "ingress"
+  description              = "Worker to Plugin Daemon"
+  protocol                 = "tcp"
+  from_port                = 5002
+  to_port                  = 5002
+  source_security_group_id = aws_security_group.worker.id
+}
+
+resource "aws_security_group_rule" "plugin_daemon_to_api" {
+  security_group_id        = aws_security_group.api.id
+  type                     = "ingress"
+  description              = "Plugin Daemon to API (inner API)"
+  protocol                 = "tcp"
+  from_port                = 5001
+  to_port                  = 5001
+  source_security_group_id = aws_security_group.plugin_daemon.id
+}
+
+resource "aws_security_group_rule" "plugin_daemon_to_database" {
+  security_group_id        = aws_security_group.database.id
+  type                     = "ingress"
+  description              = "Plugin Daemon to Database"
+  protocol                 = "tcp"
+  from_port                = 5432
+  to_port                  = 5432
+  source_security_group_id = aws_security_group.plugin_daemon.id
+}
+
+resource "aws_security_group_rule" "plugin_daemon_to_redis" {
+  security_group_id        = aws_security_group.redis.id
+  type                     = "ingress"
+  description              = "Plugin Daemon to Redis"
+  protocol                 = "tcp"
+  from_port                = 6379
+  to_port                  = 6379
+  source_security_group_id = aws_security_group.plugin_daemon.id
+}
+
+resource "aws_ecs_task_definition" "dify_plugin_daemon" {
+  family                   = "dify-plugin-daemon"
+  execution_role_arn       = aws_iam_role.exec.arn
+  task_role_arn            = aws_iam_role.app.arn
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = 1024
+  memory                   = 2048
+
+  container_definitions = jsonencode([
+    {
+      name      = "dify-plugin-daemon"
+      image     = "langgenius/dify-plugin-daemon:${var.dify_plugin_daemon_version}"
+      essential = true
+      portMappings = [
+        {
+          hostPort      = 5002
+          protocol      = "tcp"
+          containerPort = 5002
+        }
+      ]
+      environment = [
+        for name, value in {
+          # Database
+          DB_USERNAME         = var.dify_db_username
+          DB_HOST             = aws_rds_cluster.dify.endpoint
+          DB_PORT             = aws_rds_cluster.dify.port
+          DB_DATABASE         = "dify_plugin"
+          DB_DEFAULT_DATABASE = "postgres"
+          DB_SSL_MODE         = "require"
+
+          # Redis
+          REDIS_HOST         = aws_elasticache_replication_group.redis.primary_endpoint_address
+          REDIS_PORT         = aws_elasticache_replication_group.redis.port
+          REDIS_USE_SSL      = true
+          REDIS_SSL_CERT_REQS = "CERT_NONE"
+          REDIS_DB           = 0
+
+          # Server
+          SERVER_PORT             = 5002
+          MAX_PLUGIN_PACKAGE_SIZE = 52428800
+          MAX_BUNDLE_PACKAGE_SIZE = 52428800
+          PPROF_ENABLED           = false
+
+          # Platform
+          PLATFORM                         = "local"
+          PLUGIN_LOCAL_LAUNCHING_CONCURRENT = 10
+          ROUTINE_POOL_SIZE                = 100
+
+          # Dify inner API
+          DIFY_INNER_API_URL = "http://api.dify.local:5001"
+
+          # Plugin remote installing
+          PLUGIN_REMOTE_INSTALLING_HOST                = "0.0.0.0"
+          PLUGIN_REMOTE_INSTALLING_PORT                = 5003
+          PLUGIN_REMOTE_INSTALLING_MAX_CONN            = 100
+          PLUGIN_REMOTE_INSTALL_SERVER_EVENT_LOOP_NUMS = 10
+
+          # Plugin paths and execution
+          PLUGIN_WORKING_PATH          = "/app/storage/cwd"
+          PLUGIN_MAX_EXECUTION_TIMEOUT = 600
+          PYTHON_ENV_INIT_TIMEOUT      = 120
+          PLUGIN_STDIO_BUFFER_SIZE     = 1024
+          PLUGIN_STDIO_MAX_BUFFER_SIZE = 5242880
+
+          # Lifetime management
+          LIFETIME_COLLECTION_HEARTBEAT_INTERVAL   = 30
+          LIFETIME_COLLECTION_GC_INTERVAL          = 60
+          LIFETIME_STATE_GC_INTERVAL               = 60
+          DIFY_INVOCATION_CONNECTION_IDLE_TIMEOUT   = 120
+
+          # Plugin storage (S3 for Fargate)
+          PLUGIN_STORAGE_TYPE       = "aws_s3"
+          PLUGIN_STORAGE_LOCAL_ROOT = "/app/storage"
+          PLUGIN_INSTALLED_PATH     = "plugin"
+          PLUGIN_PACKAGE_CACHE_PATH = "plugin_packages"
+          PLUGIN_MEDIA_CACHE_PATH   = "assets"
+          PLUGIN_STORAGE_OSS_BUCKET = aws_s3_bucket.storage.bucket
+
+          S3_USE_AWS_MANAGED_IAM = true
+          S3_USE_AWS             = true
+          AWS_REGION             = var.aws_region
+
+          # Signature verification
+          FORCE_VERIFYING_SIGNATURE = true
+
+          # Marketplace
+          MARKETPLACE_ENABLED = true
+          MARKETPLACE_API_URL = "https://marketplace.dify.ai"
+
+          LOG_LEVEL  = "INFO"
+          DEPLOY_ENV = "PRODUCTION"
+        } : { name = name, value = tostring(value) }
+      ]
+      secrets = [
+        {
+          name      = "DB_PASSWORD"
+          valueFrom = aws_ssm_parameter.db_password.name
+        },
+        {
+          name      = "REDIS_PASSWORD"
+          valueFrom = aws_ssm_parameter.redis_password.name
+        },
+        {
+          name      = "SERVER_KEY"
+          valueFrom = aws_ssm_parameter.plugin_daemon_key.name
+        },
+        {
+          name      = "DIFY_INNER_API_KEY"
+          valueFrom = aws_ssm_parameter.plugin_inner_api_key.name
+        },
+        {
+          name      = "SECRET_KEY"
+          valueFrom = aws_ssm_parameter.session_secret_key.name
+        }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.dify.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "dify-plugin-daemon"
+        }
+      }
+      # healthCheck = {
+      #   command     = ["CMD-SHELL", "curl -f http://localhost:5002 || exit 1"]
+      #   interval    = 10
+      #   timeout     = 5
+      #   retries     = 3
+      #   startPeriod = 30
+      # }
+      cpu         = 0
+      volumesFrom = []
+      mountPoints = []
+    },
+  ])
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Dify Web Task
@@ -803,8 +1081,10 @@ resource "aws_ecs_task_definition" "dify_web" {
           # # The URL for Web APP api server, refers to the Web App base URL of WEB service if web app domain is different from
           # # console or api domain.
           # # example: http://udify.app
-          APP_API_URL = "http://${aws_lb.dify.dns_name}"
+          APP_API_URL             = "http://${aws_lb.dify.dns_name}"
           NEXT_TELEMETRY_DISABLED = "0"
+          MARKETPLACE_API_URL     = "https://marketplace.dify.ai"
+          MARKETPLACE_URL         = "https://marketplace.dify.ai"
         } : { name = name, value = tostring(value) }
       ]
       portMappings = [
@@ -841,7 +1121,7 @@ resource "aws_ecs_task_definition" "dify_web" {
 resource "aws_security_group" "web" {
   name        = "dify-web"
   description = "Dify Web"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-web" }
 }
 
@@ -872,7 +1152,7 @@ resource "aws_security_group_rule" "alb_to_web" {
 resource "aws_security_group" "alb" {
   name        = "dify-alb"
   description = "ALB (Reverse Proxy) for Dify"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   tags        = { Name = "dify-alb" }
 }
 
@@ -899,7 +1179,7 @@ resource "aws_security_group_rule" "http_from_internet" {
 resource "aws_lb" "dify" {
   name               = "dify-alb"
   load_balancer_type = "application"
-  subnets            = var.public_subnet_ids
+  subnets            = local.public_subnet_ids
   security_groups    = [aws_security_group.alb.id]
 }
 
@@ -907,7 +1187,7 @@ resource "aws_lb" "dify" {
 
 resource "aws_lb_target_group" "web" {
   name        = "dify-web"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   protocol    = "HTTP"
   port        = 3000
   target_type = "ip"
@@ -976,7 +1256,7 @@ resource "aws_lb_listener_rule" "api_wildcard" {
 
 resource "aws_lb_target_group" "api" {
   name        = "dify-api"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
   protocol    = "HTTP"
   port        = 5001
   target_type = "ip"
@@ -991,6 +1271,52 @@ resource "aws_lb_target_group" "api" {
     # healthy_threshold   = 3
     # unhealthy_threshold = 5
   }
+}
+
+# Service Discovery (Cloud Map)
+
+resource "aws_service_discovery_private_dns_namespace" "dify" {
+  name        = "dify.local"
+  description = "Private DNS namespace for Dify inter-service communication"
+  vpc         = local.vpc_id
+}
+
+resource "aws_service_discovery_service" "plugin_daemon" {
+  name = "plugin-daemon"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.dify.id
+
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+
+    routing_policy = "MULTIVALUE"
+  }
+
+  health_check_custom_config {}
+
+  force_destroy = true
+}
+
+resource "aws_service_discovery_service" "api" {
+  name = "api"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.dify.id
+
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+
+    routing_policy = "MULTIVALUE"
+  }
+
+  health_check_custom_config {}
+
+  force_destroy = true
 }
 
 # ECS Cluster
@@ -1011,7 +1337,7 @@ resource "aws_ecs_cluster_capacity_providers" "this" {
 # ECS Service
 
 resource "aws_ecs_service" "api" {
-  depends_on      = [aws_lb_listener_rule.api] # ターゲットグループが ALB と紐付いていないと構築時にエラーになる
+  depends_on      = [aws_lb_listener_rule.api]
   name            = "dify-api"
   cluster         = aws_ecs_cluster.dify.name
   desired_count   = var.api_desired_count
@@ -1020,7 +1346,7 @@ resource "aws_ecs_service" "api" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = var.private_subnet_ids
+    subnets         = local.private_subnet_ids
     security_groups = [aws_security_group.api.id]
   }
 
@@ -1028,6 +1354,28 @@ resource "aws_ecs_service" "api" {
     target_group_arn = aws_lb_target_group.api.arn
     container_name   = "dify-api"
     container_port   = 5001
+  }
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.api.arn
+  }
+}
+
+resource "aws_ecs_service" "plugin_daemon" {
+  name            = "dify-plugin-daemon"
+  cluster         = aws_ecs_cluster.dify.name
+  desired_count   = var.plugin_daemon_desired_count
+  task_definition = aws_ecs_task_definition.dify_plugin_daemon.arn
+  propagate_tags  = "SERVICE"
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = local.private_subnet_ids
+    security_groups = [aws_security_group.plugin_daemon.id]
+  }
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.plugin_daemon.arn
   }
 }
 
@@ -1040,7 +1388,7 @@ resource "aws_ecs_service" "worker" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = var.private_subnet_ids
+    subnets         = local.private_subnet_ids
     security_groups = [aws_security_group.worker.id]
   }
 }
@@ -1054,7 +1402,7 @@ resource "aws_ecs_service" "web" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets         = var.private_subnet_ids
+    subnets         = local.private_subnet_ids
     security_groups = [aws_security_group.web.id]
   }
 
