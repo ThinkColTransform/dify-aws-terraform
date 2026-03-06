@@ -40,3 +40,4 @@ backend.tf
 
 *.tfplan
 *-plan.txt
+plans/*

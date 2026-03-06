@@ -92,3 +92,7 @@ variable "web_desired_count" {
 variable "plugin_daemon_desired_count" {
   default = 1
 }
+
+variable "sandbox_desired_count" {
+  default = 1
+}

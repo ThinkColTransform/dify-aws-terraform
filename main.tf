@@ -384,10 +384,6 @@ resource "aws_ecs_task_definition" "dify_api" {
   cpu                      = 1024 # TODO: variable
   memory                   = 2048 # TODO: variable
 
-  volume {
-    name = "dependencies"
-  }
-
   container_definitions = jsonencode([
     {
       name      = "dify-api"
@@ -395,7 +391,9 @@ resource "aws_ecs_task_definition" "dify_api" {
       essential = true
       portMappings = [
         {
+          name          = "api"
           hostPort      = 5001
+          appProtocol   = "http"
           protocol      = "tcp"
           containerPort = 5001
         }
@@ -474,7 +472,7 @@ resource "aws_ecs_task_definition" "dify_api" {
           # SMTP_PASSWORD = ''
           # SMTP_USE_TLS = 'true'
           # The sandbox service endpoint.
-          CODE_EXECUTION_ENDPOINT       = "http://localhost:8194" # Fargate の task 内通信は localhost 宛
+          CODE_EXECUTION_ENDPOINT       = "http://sandbox:8194"
           CODE_MAX_NUMBER               = "9223372036854775807"
           CODE_MIN_NUMBER               = "-9223372036854775808"
           CODE_MAX_STRING_LENGTH        = 80000
@@ -485,7 +483,7 @@ resource "aws_ecs_task_definition" "dify_api" {
           # Indexing configuration
           INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH = 1000
           # Plugin daemon
-          PLUGIN_DAEMON_URL          = "http://plugin-daemon.dify.local:5002"
+          PLUGIN_DAEMON_URL          = "http://plugin-daemon:5002"
           PLUGIN_MAX_PACKAGE_SIZE    = 52428800
           PLUGIN_DAEMON_TIMEOUT      = "600.0"
           PLUGIN_REMOTE_INSTALL_HOST = "0.0.0.0"
@@ -550,64 +548,6 @@ resource "aws_ecs_task_definition" "dify_api" {
       volumesFrom = []
       mountPoints = []
     },
-    // `dify-sandbox:0.2.6` では `/dependencies/python-requirements.txt` が存在しないと起動時エラーになる。
-    // そのため、簡易的ではあるが volume を利用して sandbox から見れるファイルを作成する。
-    {
-      name      = "dify-sandbox-dependencies"
-      image     = "busybox:latest" # dify-sandbox イメージより軽量ならなんでもいい
-      essential = false
-      cpu       = 0
-      mountPoints = [
-        {
-          sourceVolume  = "dependencies"
-          containerPath = "/dependencies"
-        }
-      ]
-      entryPoint = ["sh", "-c"]
-      command    = ["touch /dependencies/python-requirements.txt && chmod 755 /dependencies/python-requirements.txt"]
-    },
-    {
-      name      = "dify-sandbox"
-      image     = "langgenius/dify-sandbox:${var.dify_sandbox_version}"
-      essential = true
-      mountPoints = [
-        {
-          sourceVolume  = "dependencies"
-          containerPath = "/dependencies"
-        }
-      ]
-      portMappings = [
-        {
-          hostPort      = 8194
-          protocol      = "tcp"
-          containerPort = 8194
-        }
-      ]
-      environment = [
-        for name, value in {
-          GIN_MODE       = "release"
-          WORKER_TIMEOUT = 15
-          ENABLE_NETWORK = true
-          SANDBOX_PORT   = 8194
-        } : { name = name, value = tostring(value) }
-      ]
-      secrets = [
-        {
-          name      = "API_KEY"
-          valueFrom = aws_ssm_parameter.sandbox_key.name
-        }
-      ]
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.dify.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "dify-sandbox"
-        }
-      }
-      cpu         = 0
-      volumesFrom = []
-    },
   ])
 
   runtime_platform {
@@ -669,7 +609,6 @@ resource "aws_security_group_rule" "api_to_redis" {
   source_security_group_id = aws_security_group.api.id
 }
 
-
 # Dify Worker Task
 resource "aws_ecs_task_definition" "dify_worker" {
   family                   = "dify-worker"
@@ -730,13 +669,15 @@ resource "aws_ecs_task_definition" "dify_worker" {
           # Indexing configuration
           INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH = "1000"
           # Plugin daemon
-          PLUGIN_DAEMON_URL         = "http://plugin-daemon.dify.local:5002"
+          PLUGIN_DAEMON_URL         = "http://plugin-daemon:5002"
           PLUGIN_MAX_PACKAGE_SIZE   = 52428800
           DB_PLUGIN_DATABASE        = "dify_plugin"
           MARKETPLACE_ENABLED       = true
           MARKETPLACE_API_URL       = "https://marketplace.dify.ai"
           FORCE_VERIFYING_SIGNATURE = true
           DEPLOY_ENV                = "PRODUCTION"
+          # Use the shared sandbox service for worker-driven workflow execution.
+          CODE_EXECUTION_ENDPOINT = "http://sandbox:8194"
         } : { name = name, value = tostring(value) }
       ]
       secrets = [
@@ -767,6 +708,10 @@ resource "aws_ecs_task_definition" "dify_worker" {
         {
           name      = "PLUGIN_DAEMON_KEY"
           valueFrom = aws_ssm_parameter.plugin_daemon_key.name
+        },
+        {
+          name      = "CODE_EXECUTION_API_KEY"
+          valueFrom = aws_ssm_parameter.sandbox_key.name
         }
       ]
       logConfiguration = {
@@ -828,6 +773,144 @@ resource "aws_security_group_rule" "worker_to_redis" {
   from_port                = 6379
   to_port                  = 6379
   source_security_group_id = aws_security_group.worker.id
+}
+
+# Dify Sandbox
+
+resource "aws_security_group" "sandbox" {
+  name        = "dify-sandbox"
+  description = "Dify Sandbox"
+  vpc_id      = local.vpc_id
+  tags        = { Name = "dify-sandbox" }
+}
+
+resource "aws_security_group_rule" "sandbox_to_internet" {
+  security_group_id = aws_security_group.sandbox.id
+  type              = "egress"
+  description       = "Internet"
+  protocol          = "all"
+  from_port         = 0
+  to_port           = 0
+  cidr_blocks       = ["0.0.0.0/0"]
+}
+
+resource "aws_security_group_rule" "api_to_sandbox" {
+  security_group_id        = aws_security_group.sandbox.id
+  type                     = "ingress"
+  description              = "API to Sandbox"
+  protocol                 = "tcp"
+  from_port                = 8194
+  to_port                  = 8194
+  source_security_group_id = aws_security_group.api.id
+}
+
+resource "aws_security_group_rule" "worker_to_sandbox" {
+  security_group_id        = aws_security_group.sandbox.id
+  type                     = "ingress"
+  description              = "Worker to Sandbox"
+  protocol                 = "tcp"
+  from_port                = 8194
+  to_port                  = 8194
+  source_security_group_id = aws_security_group.worker.id
+}
+
+resource "aws_ecs_task_definition" "dify_sandbox" {
+  family                   = "dify-sandbox"
+  execution_role_arn       = aws_iam_role.exec.arn
+  task_role_arn            = aws_iam_role.app.arn
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = 1024
+  memory                   = 2048
+
+  volume {
+    name = "dependencies"
+  }
+
+  container_definitions = jsonencode([
+    // `dify-sandbox:0.2.6` では `/dependencies/python-requirements.txt` が存在しないと起動時エラーになる。
+    // そのため、簡易的ではあるが volume を利用して sandbox から見れるファイルを作成する。
+    {
+      name      = "dify-sandbox-dependencies"
+      image     = "busybox:latest" # dify-sandbox イメージより軽量ならなんでもいい
+      essential = false
+      cpu       = 0
+      mountPoints = [
+        {
+          sourceVolume  = "dependencies"
+          containerPath = "/dependencies"
+        }
+      ]
+      entryPoint = ["sh", "-c"]
+      command    = ["touch /dependencies/python-requirements.txt && chmod 755 /dependencies/python-requirements.txt"]
+    },
+    {
+      name      = "dify-sandbox"
+      image     = "langgenius/dify-sandbox:${var.dify_sandbox_version}"
+      essential = true
+      dependsOn = [
+        {
+          containerName = "dify-sandbox-dependencies"
+          condition     = "SUCCESS"
+        }
+      ]
+      mountPoints = [
+        {
+          sourceVolume  = "dependencies"
+          containerPath = "/dependencies"
+        }
+      ]
+      portMappings = [
+        {
+          name          = "sandbox"
+          hostPort      = 8194
+          appProtocol   = "http"
+          protocol      = "tcp"
+          containerPort = 8194
+        }
+      ]
+      environment = [
+        for name, value in {
+          GIN_MODE       = "release"
+          WORKER_TIMEOUT = 15
+          ENABLE_NETWORK = true
+          SANDBOX_PORT   = 8194
+        } : { name = name, value = tostring(value) }
+      ]
+      secrets = [
+        {
+          name      = "API_KEY"
+          valueFrom = aws_ssm_parameter.sandbox_key.name
+        }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.dify.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "dify-sandbox"
+        }
+      }
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:8194/health || exit 1"]
+        interval    = 10
+        timeout     = 5
+        retries     = 3
+        startPeriod = 30
+      }
+      cpu         = 0
+      volumesFrom = []
+    },
+  ])
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Dify Plugin Daemon
@@ -915,7 +998,9 @@ resource "aws_ecs_task_definition" "dify_plugin_daemon" {
       essential = true
       portMappings = [
         {
+          name          = "plugin-daemon"
           hostPort      = 5002
+          appProtocol   = "http"
           protocol      = "tcp"
           containerPort = 5002
         }
@@ -949,7 +1034,7 @@ resource "aws_ecs_task_definition" "dify_plugin_daemon" {
           ROUTINE_POOL_SIZE                = 100
 
           # Dify inner API
-          DIFY_INNER_API_URL = "http://api.dify.local:5001"
+          DIFY_INNER_API_URL = "http://api:5001"
 
           # Plugin remote installing
           PLUGIN_REMOTE_INSTALLING_HOST                = "0.0.0.0"
@@ -1023,13 +1108,6 @@ resource "aws_ecs_task_definition" "dify_plugin_daemon" {
           "awslogs-stream-prefix" = "dify-plugin-daemon"
         }
       }
-      # healthCheck = {
-      #   command     = ["CMD-SHELL", "curl -f http://localhost:5002 || exit 1"]
-      #   interval    = 10
-      #   timeout     = 5
-      #   retries     = 3
-      #   startPeriod = 30
-      # }
       cpu         = 0
       volumesFrom = []
       mountPoints = []
@@ -1281,44 +1359,6 @@ resource "aws_service_discovery_private_dns_namespace" "dify" {
   vpc         = local.vpc_id
 }
 
-resource "aws_service_discovery_service" "plugin_daemon" {
-  name = "plugin-daemon"
-
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.dify.id
-
-    dns_records {
-      ttl  = 10
-      type = "A"
-    }
-
-    routing_policy = "MULTIVALUE"
-  }
-
-  health_check_custom_config {}
-
-  force_destroy = true
-}
-
-resource "aws_service_discovery_service" "api" {
-  name = "api"
-
-  dns_config {
-    namespace_id = aws_service_discovery_private_dns_namespace.dify.id
-
-    dns_records {
-      ttl  = 10
-      type = "A"
-    }
-
-    routing_policy = "MULTIVALUE"
-  }
-
-  health_check_custom_config {}
-
-  force_destroy = true
-}
-
 # ECS Cluster
 
 resource "aws_ecs_cluster" "dify" {
@@ -1356,8 +1396,19 @@ resource "aws_ecs_service" "api" {
     container_port   = 5001
   }
 
-  service_registries {
-    registry_arn = aws_service_discovery_service.api.arn
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.dify.arn
+
+    service {
+      port_name      = "api"
+      discovery_name = "api-sc"
+
+      client_alias {
+        dns_name = "api"
+        port     = 5001
+      }
+    }
   }
 }
 
@@ -1374,8 +1425,19 @@ resource "aws_ecs_service" "plugin_daemon" {
     security_groups = [aws_security_group.plugin_daemon.id]
   }
 
-  service_registries {
-    registry_arn = aws_service_discovery_service.plugin_daemon.arn
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.dify.arn
+
+    service {
+      port_name      = "plugin-daemon"
+      discovery_name = "plugin-daemon-sc"
+
+      client_alias {
+        dns_name = "plugin-daemon"
+        port     = 5002
+      }
+    }
   }
 }
 
@@ -1390,6 +1452,40 @@ resource "aws_ecs_service" "worker" {
   network_configuration {
     subnets         = local.private_subnet_ids
     security_groups = [aws_security_group.worker.id]
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.dify.arn
+  }
+}
+
+resource "aws_ecs_service" "sandbox" {
+  name            = "dify-sandbox"
+  cluster         = aws_ecs_cluster.dify.name
+  desired_count   = var.sandbox_desired_count
+  task_definition = aws_ecs_task_definition.dify_sandbox.arn
+  propagate_tags  = "SERVICE"
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = local.private_subnet_ids
+    security_groups = [aws_security_group.sandbox.id]
+  }
+
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.dify.arn
+
+    service {
+      port_name      = "sandbox"
+      discovery_name = "sandbox-sc"
+
+      client_alias {
+        dns_name = "sandbox"
+        port     = 8194
+      }
+    }
   }
 }
 
