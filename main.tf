@@ -246,6 +246,7 @@ resource "aws_cloudwatch_log_group" "dify" {
 
 locals {
   ssm_parameter_prefix = "/dify"
+  ecr_base             = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
 }
 
 # セキュアにするなら Credentials は Terraform で管理しない方がいいと思う。
@@ -387,7 +388,8 @@ resource "aws_ecs_task_definition" "dify_api" {
   container_definitions = jsonencode([
     {
       name      = "dify-api"
-      image     = "langgenius/dify-api:${var.dify_api_version}"
+      # image     = "langgenius/dify-api:${var.dify_api_version}"
+      image     = "${local.ecr_base}/dify-api:${var.dify_api_version}"
       essential = true
       portMappings = [
         {
@@ -622,7 +624,8 @@ resource "aws_ecs_task_definition" "dify_worker" {
   container_definitions = jsonencode([
     {
       name      = "dify-worker"
-      image     = "langgenius/dify-api:${var.dify_api_version}"
+      # image     = "langgenius/dify-api:${var.dify_api_version}"
+      image     = "${local.ecr_base}/dify-api:${var.dify_api_version}"
       essential = true
       environment = [
         for name, value in {
@@ -832,7 +835,7 @@ resource "aws_ecs_task_definition" "dify_sandbox" {
     // そのため、簡易的ではあるが volume を利用して sandbox から見れるファイルを作成する。
     {
       name      = "dify-sandbox-dependencies"
-      image     = "busybox:latest" # dify-sandbox イメージより軽量ならなんでもいい
+      image     = "${local.ecr_base}/busybox:latest" # dify-sandbox イメージより軽量ならなんでもいい
       essential = false
       cpu       = 0
       mountPoints = [
@@ -846,7 +849,8 @@ resource "aws_ecs_task_definition" "dify_sandbox" {
     },
     {
       name      = "dify-sandbox"
-      image     = "langgenius/dify-sandbox:${var.dify_sandbox_version}"
+      # image     = "langgenius/dify-sandbox:${var.dify_sandbox_version}"
+      image     = "${local.ecr_base}/dify-sandbox:${var.dify_sandbox_version}"
       essential = true
       dependsOn = [
         {
@@ -994,7 +998,8 @@ resource "aws_ecs_task_definition" "dify_plugin_daemon" {
   container_definitions = jsonencode([
     {
       name      = "dify-plugin-daemon"
-      image     = "langgenius/dify-plugin-daemon:${var.dify_plugin_daemon_version}"
+      # image     = "langgenius/dify-plugin-daemon:${var.dify_plugin_daemon_version}"
+      image     = "${local.ecr_base}/dify-plugin-daemon:${var.dify_plugin_daemon_version}"
       essential = true
       portMappings = [
         {
@@ -1148,7 +1153,8 @@ resource "aws_ecs_task_definition" "dify_web" {
   container_definitions = jsonencode([
     {
       name      = "dify-web"
-      image     = "langgenius/dify-web:${var.dify_web_version}"
+      image     = "${local.ecr_base}/dify-web:${var.dify_web_version}"
+      # image     = "langgenius/dify-web:${var.dify_web_version}"
       essential = true
       environment = [
         for name, value in {
