@@ -488,6 +488,7 @@ resource "aws_ecs_task_definition" "dify_api" {
           PLUGIN_DAEMON_URL          = "http://plugin-daemon:5002"
           PLUGIN_MAX_PACKAGE_SIZE    = 52428800
           PLUGIN_DAEMON_TIMEOUT      = "600.0"
+          SERVER_WORKER_TIMEOUT      = 280
           PLUGIN_REMOTE_INSTALL_HOST = "0.0.0.0"
           PLUGIN_REMOTE_INSTALL_PORT = 5003
           DB_PLUGIN_DATABASE         = "dify_plugin"
@@ -1265,6 +1266,7 @@ resource "aws_lb" "dify" {
   load_balancer_type = "application"
   subnets            = local.public_subnet_ids
   security_groups    = [aws_security_group.alb.id]
+  idle_timeout       = 300
 }
 
 # ALB Listener (HTTP)
