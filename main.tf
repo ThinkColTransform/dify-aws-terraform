@@ -411,16 +411,16 @@ resource "aws_ecs_task_definition" "dify_api" {
           # The base URL of console application web frontend, refers to the Console base URL of WEB service if console domain is
           # different from api or web app domain.
           # example: http://cloud.dify.ai
-          CONSOLE_WEB_URL = "http://${aws_lb.dify.dns_name}"
+          CONSOLE_WEB_URL = var.dify_base_url
           # The base URL of console application api server, refers to the Console base URL of WEB service if console domain is different from api or web app domain.
           # example: http://cloud.dify.ai
-          CONSOLE_API_URL = "http://${aws_lb.dify.dns_name}"
+          CONSOLE_API_URL = var.dify_base_url
           # The URL prefix for Service API endpoints, refers to the base URL of the current API service if api domain is different from console domain.
           # example: http://api.dify.ai
-          SERVICE_API_URL = "http://${aws_lb.dify.dns_name}"
+          SERVICE_API_URL = var.dify_base_url
           # The URL prefix for Web APP frontend, refers to the Web App base URL of WEB service if web app domain is different from console or api domain.
           # example: http://udify.app
-          APP_WEB_URL = "http://${aws_lb.dify.dns_name}"
+          APP_WEB_URL = var.dify_base_url
           # When enabled, migrations will be executed prior to application startup and the application will start after the migrations have completed.
           MIGRATION_ENABLED = var.migration_enabled
           # The configurations of postgres database connection.
@@ -877,7 +877,7 @@ resource "aws_ecs_task_definition" "dify_sandbox" {
       environment = [
         for name, value in {
           GIN_MODE       = "release"
-          WORKER_TIMEOUT = 15
+          WORKER_TIMEOUT = 300
           ENABLE_NETWORK = true
           SANDBOX_PORT   = 8194
         } : { name = name, value = tostring(value) }
@@ -1162,11 +1162,11 @@ resource "aws_ecs_task_definition" "dify_web" {
           # The base URL of console application api server, refers to the Console base URL of WEB service if console domain is
           # different from api or web app domain.
           # example: http://cloud.dify.ai
-          CONSOLE_API_URL = "http://${aws_lb.dify.dns_name}"
+          CONSOLE_API_URL = var.dify_base_url
           # # The URL for Web APP api server, refers to the Web App base URL of WEB service if web app domain is different from
           # # console or api domain.
           # # example: http://udify.app
-          APP_API_URL             = "http://${aws_lb.dify.dns_name}"
+          APP_API_URL             = var.dify_base_url
           NEXT_TELEMETRY_DISABLED = "0"
           MARKETPLACE_API_URL     = "https://marketplace.dify.ai"
           MARKETPLACE_URL         = "https://marketplace.dify.ai"
@@ -1254,10 +1254,10 @@ resource "aws_security_group_rule" "alb_to_targetgroup" {
 resource "aws_security_group_rule" "http_from_internet" {
   security_group_id = aws_security_group.alb.id
   type              = "ingress"
-  description       = "HTTP from Internet"
+  description       = "HTTPS from Internet"
   protocol          = "tcp"
-  from_port         = 80
-  to_port           = 80
+  from_port         = 443
+  to_port           = 443
   cidr_blocks       = var.allowed_cidr_blocks
 }
 
@@ -1292,8 +1292,10 @@ resource "aws_lb_target_group" "web" {
 
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.dify.arn
-  port              = 80
-  protocol          = "HTTP"
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.acm_certificate_arn
 
   default_action {
     type             = "forward"
@@ -1416,6 +1418,13 @@ resource "aws_ecs_service" "api" {
         dns_name = "api"
         port     = 5001
       }
+
+      # Prevent Envoy's default 15-second route timeout from killing long-running
+      # code-execution requests from the API container.
+      timeout {
+        idle_timeout_seconds        = 300
+        per_request_timeout_seconds = 300
+      }
     }
   }
 }
@@ -1492,6 +1501,13 @@ resource "aws_ecs_service" "sandbox" {
       client_alias {
         dns_name = "sandbox"
         port     = 8194
+      }
+
+      # Prevent Envoy's default 15-second route timeout from killing long-running
+      # code-execution requests from the API container.
+      timeout {
+        idle_timeout_seconds        = 300
+        per_request_timeout_seconds = 300
       }
     }
   }

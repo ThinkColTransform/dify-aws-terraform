@@ -72,7 +72,15 @@ variable "dify_db_name" {
 variable "allowed_cidr_blocks" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
-  description = "CIDR blocks allowed to reach the ALB on HTTP (e.g. [\"1.2.3.4/32\"] to restrict). Default allows all."
+  description = "CIDR blocks allowed to reach the ALB on HTTPS (e.g. [\"1.2.3.4/32\"] to restrict). Default allows all."
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of the ACM certificate to attach to the ALB HTTPS listener (self-signed cert imported into ACM)."
+}
+
+variable "dify_base_url" {
+  description = "Public base URL for the Dify deployment (e.g. https://thinkcol-dify.com). Used for CONSOLE_API_URL, SERVICE_API_URL, etc."
 }
 
 # Service
