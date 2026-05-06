@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "namespace": "arn:aws:servicediscovery:ap-east-1:528425707766:namespace/ns-2jdbcekngljqch57",
+  "services": [
+    {
+      "portName": "plugin-daemon",
+      "discoveryName": "plugin-daemon-sc",
+      "clientAliases": [
+        {
+          "port": 5002,
+          "dnsName": "plugin-daemon"
+        }
+      ],
+      "timeout": {
+        "idleTimeoutSeconds": 300,
+        "perRequestTimeoutSeconds": 300
+      }
+    }
+  ]
+}

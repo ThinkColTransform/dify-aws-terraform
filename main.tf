@@ -674,6 +674,7 @@ resource "aws_ecs_task_definition" "dify_worker" {
           INDEXING_MAX_SEGMENTATION_TOKENS_LENGTH = "1000"
           # Plugin daemon
           PLUGIN_DAEMON_URL         = "http://plugin-daemon:5002"
+          PLUGIN_DAEMON_TIMEOUT     = "600.0"
           PLUGIN_MAX_PACKAGE_SIZE   = 52428800
           DB_PLUGIN_DATABASE        = "dify_plugin"
           MARKETPLACE_ENABLED       = true
@@ -1453,6 +1454,13 @@ resource "aws_ecs_service" "plugin_daemon" {
       client_alias {
         dns_name = "plugin-daemon"
         port     = 5002
+      }
+
+      # Prevent Envoy's default 15-second route timeout from killing long-running
+      # streaming LLM invocation responses from the plugin daemon.
+      timeout {
+        idle_timeout_seconds        = 300
+        per_request_timeout_seconds = 300
       }
     }
   }
